@@ -1,0 +1,11 @@
+[package]
+name = "fwatch"
+version = "0.1.0"
+authors = ["Eugene Marcotte <emarcotte@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+ignore = "0.4.7"
+inotify = "0.7.0"
+clap = "2.33.0"
+regex = "1.1.7"
