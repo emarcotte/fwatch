@@ -1,38 +1,22 @@
+use bytes::buf::BufMut;
+use bytes::BytesMut;
+use futures::Stream;
 use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
-
-use inotify::{
-    EventMask,
-    Inotify,
-    WatchDescriptor,
-    WatchMask,
-    Event,
-};
-
+use inotify::{Event, Inotify, WatchDescriptor, WatchMask};
 use regex::Regex;
-
-use std::ffi::{OsStr, OsString};
-
+use shared_child::SharedChild;
 use std::collections::HashMap;
-
-use std::path::{PathBuf};
-
-use std::process::{Child, Command};
-use std::{thread};
-
-use std::sync::mpsc::{
-    channel,
-    Sender,
-};
+use std::ffi::{OsStr, OsString};
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::Arc;
 
 type WatchMap = HashMap<WatchDescriptor, PathBuf>;
-type NextCommand = PathBuf;
-
 
 /// FWatch runtime info
 pub struct Runtime {
     map: WatchMap,
-    inotify: Inotify,
     template: Vec<String>,
     extension: Option<String>,
     regex: Option<Regex>,
@@ -40,34 +24,26 @@ pub struct Runtime {
 
 impl Runtime {
     /// Setup the runtime.
-    pub fn new(
-        template: Vec<String>,
-        extension: Option<String>,
-        regex: Option<Regex>,
-    ) -> Result<Runtime, String> {
-        let (inotify, map) = watch_directories()?;
-        Ok(Runtime {
-            inotify,
-            map,
-            template: template,
+    pub fn new(template: Vec<String>, extension: Option<String>, regex: Option<Regex>) -> Runtime {
+        Runtime {
+            map: WatchMap::new(),
+            template,
             extension,
             regex,
-        })
+        }
     }
 
+    /// Find the path for a `WatchDescriptor`.
     fn get_path(&self, wd: &WatchDescriptor, n: &OsStr) -> Result<PathBuf, String> {
         match self.map.get(&wd) {
-            None => Err("Could not find WD!".to_string()),
             Some(p) => Ok(p.join(n)),
+            None => Err("Could not find WD!".to_string()),
         }
     }
 
-    fn filter_event(&self, event: &Event<&OsStr>) -> Option<PathBuf> {
-        if event.mask.contains(EventMask::CLOSE_WRITE) {
-            return None;
-        }
-
-        if let Some(p) = event.name {
+    /// Prune down to the events that are something we should invoke the command
+    fn is_executable_event(&self, event: &Event<OsString>) -> Option<PathBuf> {
+        if let Some(p) = &event.name {
             if let Ok(real_file) = self.get_path(&event.wd, &p) {
                 if let Some(ext_matcher) = &self.extension {
                     if let Some(actual_ext) = real_file.extension() {
@@ -75,112 +51,114 @@ impl Runtime {
                             return Some(real_file.to_path_buf());
                         }
                     }
-                };
+                }
 
                 if let Some(regex_matcher) = &self.regex {
                     if regex_matcher.is_match(&real_file.to_string_lossy()) {
                         return Some(real_file.to_path_buf());
                     }
                 }
+
+                if self.regex.is_none() && self.extension.is_none() {
+                    return Some(real_file.to_path_buf());
+                }
             }
         }
         None
     }
 
+    /// Kick off the event loop.
+    pub fn run(mut self) -> Result<(), String> {
+        // TODO: Remove all expect/unwrap calls.
+        /* TODO: watch new directories...
+         if event.mask.contains(EventMask::CREATE) {
+         if event.mask.contains(EventMask::ISDIR) {
+        */
 
-    pub fn run(&mut self) -> Result<(), String> {
-        let mut buffer = [0u8; 4096];
-        let monitor = monitor_child(&self.template);
-        loop {
-            let events = self
-                .inotify
-                .read_events_blocking(&mut buffer)
-                .expect("Failed to read inotify events");
-            /*
-             * TODO: watch new directories...
-               if event.mask.contains(EventMask::CREATE) {
-               if event.mask.contains(EventMask::ISDIR) {
-           */
-            for e in events.filter_map(|e| self.filter_event(&e)) {
-                monitor.send(e.to_path_buf())
-                    .or_else(|e| Err(format!("Couldn't send message to monitor thread: {}", e)))?;
+        let mut inotify = Inotify::init().expect("Couldn't start up inotify");
+
+        // TODO: http://man7.org/linux/man-pages/man7/inotify.7.html
+        // sizeof(struct inotify_event) + NAME_MAX + 1
+        let mut buf = BytesMut::with_capacity(4096);
+        buf.put_slice(&[0u8; 4096]);
+
+        // TODO: Move out of here.
+        self.watch_directories(&mut inotify, "./")
+            .expect("Error watching directories");
+
+        let stream = inotify.event_stream(buf);
+
+        let mut running: Option<Arc<SharedChild>> = None;
+        for event in stream.wait() {
+            let event = event.unwrap();
+            if let Some(path) = self.is_executable_event(&event) {
+                let started = Arc::new(self.start(&path));
+
+                let wait_clone = started.clone();
+                std::thread::spawn(move || {
+                    wait_clone.wait().unwrap();
+                });
+
+                if let Some(running) = running {
+                    running.kill().unwrap();
+                }
+                running = Some(started);
             }
         }
-    }
-}
 
-fn monitor_child(template: &Vec<String>) -> Sender<NextCommand> {
-    let template = template.iter().map(|e| e.clone()).collect::<Vec<String>>();
-    let (tx, rx) = channel::<PathBuf>();
-    thread::spawn(move || {
-        let mut running: Option<Child> = None;
-        loop {
-            match rx.recv() {
-                Ok(next) => {
-                    if let Some(mut c) = running {
-                        match c.try_wait() {
-                            Ok(None) => {
-                                match c.kill() { _ => {} };
-                                match c.wait() { _ => {} };
-                            }
-                            _ => {
-                            }
-                        }
+        Ok(())
+    }
+
+    /// Add the given path to the runtime.
+    fn watch_directories(&mut self, inotify: &mut Inotify, path: &str) -> Result<(), String> {
+        let mask = WatchMask::CLOSE_WRITE | WatchMask::MOVE;
+
+        let overrides = OverrideBuilder::new(path)
+            .add("!.git")
+            .map_err(|e| format!("Error building overrides: {}", e.to_string()))?
+            .build()
+            .expect("Couldn't parse ignore file");
+
+        let mut builder = WalkBuilder::new("./");
+        builder.hidden(false).overrides(overrides);
+
+        for entry in builder.build() {
+            match entry {
+                Ok(entry) => {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        let wd = inotify.add_watch(path, mask).or_else(|e| {
+                            Err(format!(
+                                "Failed to add watch to {:?}: {}",
+                                path,
+                                e.to_string()
+                            ))
+                        })?;
+                        self.map.insert(wd, path.to_owned());
                     }
-
-                    let command = template.get(0).unwrap();
-                    let args: Vec<OsString> = template.iter()
-                        .skip(1)
-                        .map(|e| OsString::from(e.replace("{}", &next.to_string_lossy())))
-                        .collect();
-
-                    running = Some(
-                        Command::new(&command).args(&args).spawn().unwrap()
-                    );
                 }
-                _ => { }
-            }
-        }
-    });
-
-    tx
-}
-
-fn watch_directories() -> Result<(Inotify, WatchMap), String> {
-    let mask=  WatchMask::CLOSE_WRITE | WatchMask::MOVE;
-    let mut inotify = Inotify::init()
-        .or_else(|e| Err(format!("Could not startup inotify: {}", e.to_string())))?;
-
-    let mut wd_map = HashMap::new();
-
-    let mut override_builder = OverrideBuilder::new("./");
-    override_builder
-        .add("!.git")
-        .expect("Couldn't parse ignore file");
-
-    let mut builder = WalkBuilder::new("./");
-    builder
-        .hidden(false)
-        .overrides(override_builder.build().expect("Couldn't build overrides"));
-
-    for entry in builder.build() {
-        match entry {
-            Ok(entry) => {
-                let path = entry.path();
-                if path.is_dir() {
-                    let wd = inotify.add_watch(path, mask).or_else(|e| {
-                        Err(format!(
-                            "Failed to add watch to {:?}: {}",
-                            path,
-                            e.to_string()
-                        ))
-                    })?;
-                    wd_map.insert(wd, path.to_owned());
+                Err(err) => {
+                    println!("Warning, couldn't walk directory: {}", err);
                 }
             }
-            Err(err) => println!("E: {}", err),
         }
+
+        Ok(())
     }
 
-    Ok((inotify, wd_map))
+    /// Given a file name, build and start a child process.
+    fn start(&self, next: &PathBuf) -> SharedChild {
+        let command = &self.template[0];
+        let args: Vec<OsString> = self
+            .template
+            .iter()
+            .skip(1)
+            .map(|e| OsString::from(e.replace("{}", &next.to_string_lossy())))
+            .collect();
+
+        let mut c = Command::new(&command);
+        c.args(&args);
+
+        SharedChild::spawn(&mut c).unwrap()
+    }
 }

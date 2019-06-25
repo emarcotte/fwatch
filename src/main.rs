@@ -5,11 +5,11 @@ use fwatch::Runtime;
 use regex::Regex;
 
 fn main() -> Result<(), String> {
-    let (template, extension, regex) = parse_cli()?;
-    Runtime::new(template, extension, regex)?.run()
+    parse_cli()?.run()?;
+    Ok(())
 }
 
-fn parse_cli() -> Result<(Vec<String>, Option<String>, Option<Regex>), String> {
+fn parse_cli() -> Result<Runtime, String> {
     let matches = App::new("fwatch")
         .version("1.0")
         .about("Watch files")
@@ -35,17 +35,18 @@ fn parse_cli() -> Result<(Vec<String>, Option<String>, Option<Regex>), String> {
         .values_of("slop")
         .map(|e| e.map(|e| e.to_string()).collect::<Vec<String>>());
 
-    match slop {
+    let template = match slop {
+        Some(opts) => Ok(opts),
         None => Err("No command provided".to_string()),
-        Some(opts) => Ok((
-            opts,
-            matches.value_of("ext")
-                .map(|e| e.to_string()),
-            match matches.value_of("regex").map(|e| Regex::new(e)) {
-                Some(Err(e)) => Err(e.to_string()),
-                Some(Ok(r))  => Ok(Some(r)),
-                None         => Ok(None),
-            }?,
-        )),
-    }
+    }?;
+
+    let extension = matches.value_of("ext").map(|e| e.to_string());
+
+    let regex = match matches.value_of("regex").map(|e| Regex::new(e)) {
+        Some(Err(e)) => Err(e.to_string()),
+        Some(Ok(r)) => Ok(Some(r)),
+        None => Ok(None),
+    }?;
+
+    Ok(Runtime::new(template, extension, regex))
 }
