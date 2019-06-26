@@ -20,16 +20,18 @@ pub struct Runtime {
     template: Vec<String>,
     extension: Option<String>,
     regex: Option<Regex>,
+    dirs: Vec<String>,
 }
 
 impl Runtime {
     /// Setup the runtime.
-    pub fn new(template: Vec<String>, extension: Option<String>, regex: Option<Regex>) -> Runtime {
+    pub fn new(template: Vec<String>, extension: Option<String>, regex: Option<Regex>, dirs: Vec<String>) -> Runtime {
         Runtime {
             map: WatchMap::new(),
             template,
             extension,
             regex,
+            dirs,
         }
     }
 
@@ -83,8 +85,10 @@ impl Runtime {
         buf.put_slice(&[0u8; 4096]);
 
         // TODO: Move out of here.
-        self.watch_directories(&mut inotify, "./")
-            .expect("Error watching directories");
+        for dir in self.dirs.clone() {
+            self.watch_directories(&mut inotify, &dir)
+                .expect("Error watching directories");
+        }
 
         let stream = inotify.event_stream(buf);
 
@@ -127,6 +131,7 @@ impl Runtime {
                 Ok(entry) => {
                     let path = entry.path();
                     if path.is_dir() {
+                        // TODO: Prevent adding multiple watches to the same directory.
                         let wd = inotify.add_watch(path, mask).or_else(|e| {
                             Err(format!(
                                 "Failed to add watch to {:?}: {}",
