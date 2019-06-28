@@ -1,9 +1,10 @@
-use bytes::buf::BufMut;
 use bytes::BytesMut;
+use bytes::buf::BufMut;
 use futures::Stream;
-use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
+use ignore::overrides::OverrideBuilder;
 use inotify::{Event, Inotify, WatchDescriptor, WatchMask};
+use crate::pager::{ Pager, };
 use regex::Regex;
 use shared_child::SharedChild;
 use std::collections::HashMap;
@@ -16,22 +17,27 @@ type WatchMap = HashMap<WatchDescriptor, PathBuf>;
 
 /// FWatch runtime info
 pub struct Runtime {
-    map: WatchMap,
-    template: Vec<String>,
-    extension: Option<String>,
-    regex: Option<Regex>,
     dirs: Vec<String>,
+    extension: Option<String>,
+    map: WatchMap,
+    pager: Option<Pager>,
+    regex: Option<Regex>,
+    template: Vec<String>,
 }
 
 impl Runtime {
     /// Setup the runtime.
-    pub fn new(template: Vec<String>, extension: Option<String>, regex: Option<Regex>, dirs: Vec<String>) -> Runtime {
+    pub fn new(template: Vec<String>, extension: Option<String>, regex: Option<Regex>, dirs: Vec<String>, pager: bool) -> Runtime {
         Runtime {
             map: WatchMap::new(),
             template,
             extension,
             regex,
             dirs,
+            pager: match pager {
+                true  => Some(Pager::new()),
+                false => None,
+            },
         }
     }
 
@@ -96,7 +102,13 @@ impl Runtime {
         for event in stream.wait() {
             let event = event.unwrap();
             if let Some(path) = self.is_executable_event(&event) {
-                let started = Arc::new(self.start(&path));
+
+                if let Some(pager) = &mut self.pager {
+                    pager.stop();
+                }
+
+                let child = self.start(&path)?;
+                let started = Arc::new(child);
 
                 let wait_clone = started.clone();
                 std::thread::spawn(move || {
@@ -152,7 +164,7 @@ impl Runtime {
     }
 
     /// Given a file name, build and start a child process.
-    fn start(&self, next: &PathBuf) -> SharedChild {
+    fn start(&mut self, next: &PathBuf) -> Result<SharedChild, String> {
         let command = &self.template[0];
         let args: Vec<OsString> = self
             .template
@@ -164,6 +176,13 @@ impl Runtime {
         let mut c = Command::new(&command);
         c.args(&args);
 
-        SharedChild::spawn(&mut c).unwrap()
+        if let Some(pager) = &mut self.pager {
+            let stream = pager.start()?;
+            c.stdout(stream.try_clone().unwrap());
+            c.stderr(stream);
+        }
+
+        SharedChild::spawn(&mut c)
+            .map_err(|e| format!("Spawn error: {}", e.to_string()))
     }
 }

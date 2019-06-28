@@ -1,4 +1,5 @@
 mod fwatch;
+mod pager;
 
 use clap::{App, AppSettings, Arg, Shell, SubCommand, };
 use fwatch::Runtime;
@@ -8,7 +9,6 @@ enum CommandInput {
     Run(Runtime),
     Completions,
 }
-
 
 fn main() -> Result<(), String> {
     match parse_cli()? {
@@ -36,6 +36,10 @@ fn build_cli() -> App<'static, 'static> {
                          .multiple(true)
                          .required(true)
                          .min_values(1))
+                    .arg(Arg::with_name("pager")
+                         .long("pager")
+                         .short("p")
+                         .help("Run with a pager"))
                     .arg(Arg::with_name("ext")
                          .long("ext")
                          .short("e")
@@ -81,8 +85,9 @@ fn parse_cli() -> Result<CommandInput, String> {
                 .map(|e| e.map(|e| e.to_string()).collect::<Vec<String>>())
                 .ok_or_else(|| "No dirs provided")?;
 
+            let pager = matches.is_present("pager");
 
-            Ok(CommandInput::Run(Runtime::new(template, extension, regex, dirs)))
+            Ok(CommandInput::Run(Runtime::new(template, extension, regex, dirs, pager)))
         }
         (_, _) => unimplemented!(),
     }
