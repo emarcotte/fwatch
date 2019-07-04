@@ -19,7 +19,15 @@ impl Pager {
             .map_err(|e| format!("Pipe creation error: {}", e.to_string()))?;
 
         let mut c = Command::new("less");
-        c.args(vec!("-SRXKc~", "--mouse"));
+        c.args(vec!(
+                "--chop-long-lines",
+                "--raw-control-chars",
+                "--no-init",
+                "--quit-on-intr",
+                "--CLEAR-SCREEN",
+                "--tilde",
+                "--mouse",
+        ));
         c.stdin(input);
         let proc = SharedChild::spawn(&mut c).unwrap();
         let started = Arc::new(proc);

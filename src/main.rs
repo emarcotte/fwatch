@@ -63,31 +63,29 @@ fn parse_cli() -> Result<CommandInput, String> {
     match build_cli().get_matches().subcommand() {
         ("completions", _) => Ok(CommandInput::Completions),
         ("run", Some(matches)) => {
-            let command = matches
-                .values_of("command")
-                .map(|e| e.map(|e| e.to_string()).collect::<Vec<String>>());
+            let mut runtime = Runtime::new(
+                matches.values_of("command")
+                .ok_or_else(|| "No template provided")?
+                .map(str::to_string)
+                .collect())?;
 
-            let template = match command {
-                Some(opts) => Ok(opts),
-                None => Err("No command provided".to_string()),
-            }?;
 
-            let extension = matches.value_of("ext").map(|e| e.to_string());
+            matches.value_of("ext")
+                .map(|e| runtime.set_extension(e.to_string()));
 
-            let regex = match matches.value_of("regex").map(Regex::new) {
-                Some(Err(e)) => Err(e.to_string()),
-                Some(Ok(r)) => Ok(Some(r)),
-                None => Ok(None),
-            }?;
+            matches.value_of("regex")
+                .map(|re| runtime.set_regex(Regex::new(re).expect("Invalid regex")));
 
-            let dirs = matches
-                .values_of("dirs")
-                .map(|e| e.map(|e| e.to_string()).collect::<Vec<String>>())
-                .ok_or_else(|| "No dirs provided")?;
+            matches.values_of("dirs")
+                .ok_or_else(|| "No dirs provided")?
+                .for_each(|dir| {
+                    runtime.watch_directories(&dir)
+                        .expect("Error watching directories");
+                });
 
-            let pager = matches.is_present("pager");
+            runtime.use_pager(matches.is_present("pager"));
 
-            Ok(CommandInput::Run(Runtime::new(template, extension, regex, dirs, pager)))
+            Ok(CommandInput::Run(runtime))
         }
         (_, _) => unimplemented!(),
     }

@@ -13,3 +13,6 @@ inotify = "0.7.0"
 os_pipe = "0.8.1"
 regex = "1.1.7"
 shared_child = "0.3.3"
+
+[dev-dependencies]
+tempfile = "3"
