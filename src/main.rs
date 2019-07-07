@@ -1,5 +1,6 @@
 mod fwatch;
 mod pager;
+mod pager2;
 
 use clap::{App, AppSettings, Arg, Shell, SubCommand, };
 use fwatch::Runtime;
@@ -10,7 +11,7 @@ enum CommandInput {
     Completions,
 }
 
-fn main() -> Result<(), String> {
+fn main() -> Result<(), Box<std::error::Error>> {
     match parse_cli()? {
         CommandInput::Run(runtime) => {
             runtime.run()?;

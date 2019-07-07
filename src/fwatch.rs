@@ -1,18 +1,26 @@
 use bytes::BytesMut;
 use bytes::buf::BufMut;
+
+use futures::prelude::*;
 use futures::stream::Stream;
+use futures::future::{Either};
+
 use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
 use inotify::{Event, EventMask, EventStream, Inotify, WatchDescriptor, WatchMask};
-use os_pipe::PipeWriter;
+use os_pipe::{PipeWriter, pipe};
 use regex::Regex;
 use shared_child::SharedChild;
 use std::collections::HashMap;
+use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::path::{ Path, PathBuf, };
 use std::process::Command;
+use std::io::{ BufRead, BufReader, Read };
 use std::sync::Arc;
-use super::pager::{ Pager, };
+use super::pager2::{ Pager2 };
+use tokio::sync::mpsc::{channel, Receiver};
+use tokio_threadpool::{ThreadPool};
 
 type WatchMap = HashMap<WatchDescriptor, PathBuf>;
 
@@ -21,11 +29,12 @@ pub struct Runtime {
     extension: Option<String>,
     inotify: Inotify,
     map: WatchMap,
-    pager: Option<Pager>,
+    pager: Option<Arc<Pager2>>,
     regex: Option<Regex>,
     running: Option<Arc<SharedChild>>,
     command: OsString,
     args: Vec<String>,
+    thread_pool: ThreadPool,
 }
 
 impl Runtime {
@@ -45,15 +54,16 @@ impl Runtime {
             running: None,
             command: OsString::from(&template[0]),
             args: template.into_iter().skip(1).collect(),
+            thread_pool: ThreadPool::new(),
         })
     }
 
-    pub fn use_pager(&mut self, should_page: bool) -> &mut Runtime {
+    pub fn use_pager(&mut self, should_page: bool) -> Result<&mut Runtime, Box<Error>> {
         self.pager = match should_page {
-            true  => Some(Pager::new()),
+            true  => Some(Arc::new(Pager2::new()?)),
             false => None,
         };
-        self
+        Ok(self)
     }
 
     pub fn set_extension(&mut self, ext: String) -> &mut Runtime {
@@ -125,14 +135,71 @@ impl Runtime {
     }
 
     /// Kick off the event loop.
-    pub fn run(mut self) -> Result<(), String> {
+    pub fn run(mut self) -> Result<(), Box<std::error::Error>> {
         // TODO: Remove all expect/unwrap calls.
-        let stream = self.get_stream();
+        let mut fs_stream = self.get_stream();
 
-        for event in stream.wait() {
-            self.process_event(&event.unwrap(), None);
+        if let Some((pager, mut pager_stream)) = self.start_pager() {
+            let (reader, writer) = pipe()?;
+            std::thread::spawn(move || {
+                let mut buffer = BufReader::new(reader);
+                loop {
+                    let mut buf = String::new();
+                    match buffer.read_line(&mut buf) {
+                        Ok(0)  => { pager.add("EOF"); break; },
+                        Ok(_)  => { pager.add(&buf); },
+                        Err(e) => { pager.add(&format!("Error: {}", e)); break; },
+                    };
+                };
+            });
+
+            loop {
+                let next_event_future = fs_stream.by_ref()
+                    .into_future()
+                    .select2(pager_stream.by_ref().into_future());
+
+                match next_event_future.wait() {
+                    Ok(Either::A(((fs_event, _fs_stream), _))) => {
+                        let process_output_writer = writer.try_clone()?;
+                        self.process_event(&fs_event.unwrap(), Some(process_output_writer));
+                    },
+                    Ok(Either::B(((pager_event, _pager_stream), _))) => {
+                        break;
+                    }
+                    Err(Either::A((_e, r))) => {
+                        println!("{:#?}", r);
+                        break;
+                    },
+                    _ => {
+                        println!("Generic error!");
+                        break;
+                    }
+                }
+            }
         }
+        else {
+            for event in fs_stream.wait() {
+                self.process_event(&event.unwrap(), None);
+            }
+        }
+
         Ok(())
+    }
+
+    fn start_pager(&self) -> Option<(Arc<Pager2>, Receiver<()>)> {
+        if let Some(running_pager) = &self.pager {
+            let (tx, rx) = channel(100);
+            let exit_monitor = running_pager.clone();
+            std::thread::spawn(move || {
+                exit_monitor.run();
+                tx.send(())
+                    .map_err(|e| panic!("Error!: {}", e))
+            });
+            Some((running_pager.clone(), rx))
+        }
+        else {
+            None
+        }
     }
 
     fn get_stream(&mut self) -> EventStream<BytesMut> {
@@ -148,13 +215,11 @@ impl Runtime {
             }
         }
         if let Some(path) = self.is_executable_event(&event) {
-            let mut output_stream = output;
-            if let Some(pager) = &mut self.pager {
-                pager.stop();
-                output_stream = Some(pager.start().unwrap());
+            if let Some(pager) = &self.pager {
+                pager.reset();
             }
 
-            match self.start(&path, output_stream) {
+            match self.start(&path, output) {
                 Err(e)    => println!("Error starting command: {}", e),
                 Ok(child) => {
                     if let Some(running) = &self.running {
@@ -230,9 +295,8 @@ impl Runtime {
         let started = Arc::new(child);
 
         let wait_clone = started.clone();
-        std::thread::spawn(move || {
-            wait_clone.wait().unwrap();
-        });
+
+        std::thread::spawn(move || wait_clone.wait().unwrap());
 
         Ok(started)
     }
