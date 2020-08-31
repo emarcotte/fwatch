@@ -1,27 +1,47 @@
 mod fwatch;
 mod pager;
-mod pager2;
 
 use clap::{App, AppSettings, Arg, Shell, SubCommand, };
 use fwatch::Runtime;
 use regex::Regex;
+use std::error::Error;
+
+use inotify::{
+    Inotify,
+    WatchMask,
+};
 
 enum CommandInput {
     Run(Runtime),
     Completions,
 }
 
-fn main() -> Result<(), Box<std::error::Error>> {
-    match parse_cli()? {
-        CommandInput::Run(runtime) => {
-            runtime.run()?;
+#[tokio::main]
+async fn main() {
+
+    let mut inotify = Inotify::init()
+        .expect("Failed to initialize inotify");
+
+    inotify.add_watch(".", WatchMask::CREATE | WatchMask::MODIFY).expect("...");
+
+    match parse_cli() {
+        Err(e) => {
+            eprintln!("CLI Error: {}", e);
+        }
+        Ok(CommandInput::Run(runtime)) => {
+            match runtime.run().await {
+                Err(e) => eprintln!("Top level error {:?}", e),
+                Ok(_)  => {},
+            };
         },
-        CommandInput::Completions  => {
-            build_cli().gen_completions_to("fwatch", Shell::Bash, &mut std::io::stdout());
+        Ok(CommandInput::Completions)  => {
+            build_cli()
+                .gen_completions_to(
+                    "fwatch",
+                    Shell::Bash,
+                    &mut std::io::stdout());
         },
     };
-
-    Ok(())
 }
 
 fn build_cli() -> App<'static, 'static> {
@@ -60,7 +80,7 @@ fn build_cli() -> App<'static, 'static> {
                          .last(true)))
 }
 
-fn parse_cli() -> Result<CommandInput, String> {
+fn parse_cli() -> Result<CommandInput, Box<dyn Error>> {
     match build_cli().get_matches().subcommand() {
         ("completions", _) => Ok(CommandInput::Completions),
         ("run", Some(matches)) => {
@@ -84,7 +104,7 @@ fn parse_cli() -> Result<CommandInput, String> {
                         .expect("Error watching directories");
                 });
 
-            runtime.use_pager(matches.is_present("pager"));
+            runtime.use_pager(matches.is_present("pager"))?;
 
             Ok(CommandInput::Run(runtime))
         }

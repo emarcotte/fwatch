@@ -2,8 +2,14 @@ use bytes::BytesMut;
 use bytes::buf::BufMut;
 
 use futures::prelude::*;
-use futures::stream::Stream;
-use futures::future::{Either};
+//use futures::stream::Stream;
+
+use futures::{
+    select,
+    stream::{
+        StreamExt,
+    },
+};
 
 use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
@@ -16,11 +22,10 @@ use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::path::{ Path, PathBuf, };
 use std::process::Command;
-use std::io::{ BufRead, BufReader, Read };
+use std::io::{ BufRead, BufReader, };
 use std::sync::Arc;
-use super::pager2::{ Pager2 };
-use tokio::sync::mpsc::{channel, Receiver};
-use tokio_threadpool::{ThreadPool};
+use super::pager::{ Pager };
+use futures::channel::oneshot::{channel, Receiver};
 
 type WatchMap = HashMap<WatchDescriptor, PathBuf>;
 
@@ -29,12 +34,11 @@ pub struct Runtime {
     extension: Option<String>,
     inotify: Inotify,
     map: WatchMap,
-    pager: Option<Arc<Pager2>>,
+    pager: Option<Arc<Pager>>,
     regex: Option<Regex>,
     running: Option<Arc<SharedChild>>,
     command: OsString,
     args: Vec<String>,
-    thread_pool: ThreadPool,
 }
 
 impl Runtime {
@@ -54,13 +58,12 @@ impl Runtime {
             running: None,
             command: OsString::from(&template[0]),
             args: template.into_iter().skip(1).collect(),
-            thread_pool: ThreadPool::new(),
         })
     }
 
-    pub fn use_pager(&mut self, should_page: bool) -> Result<&mut Runtime, Box<Error>> {
+    pub fn use_pager(&mut self, should_page: bool) -> Result<&mut Runtime, Box<dyn Error>> {
         self.pager = match should_page {
-            true  => Some(Arc::new(Pager2::new()?)),
+            true  => Some(Arc::new(Pager::new()?)),
             false => None,
         };
         Ok(self)
@@ -135,65 +138,71 @@ impl Runtime {
     }
 
     /// Kick off the event loop.
-    pub fn run(mut self) -> Result<(), Box<std::error::Error>> {
+    pub async fn run(mut self) -> Result<(), Box<dyn Error>> {
         // TODO: Remove all expect/unwrap calls.
-        let mut fs_stream = self.get_stream();
+        let fs_stream = self.get_stream()?;
 
-        if let Some((pager, mut pager_stream)) = self.start_pager() {
+        if let Some((pager, pager_stream)) = self.start_pager() {
             let (reader, writer) = pipe()?;
             std::thread::spawn(move || {
                 let mut buffer = BufReader::new(reader);
                 loop {
                     let mut buf = String::new();
                     match buffer.read_line(&mut buf) {
-                        Ok(0)  => { pager.add("EOF"); break; },
+                        Ok(0)  => { pager.add("ZzzEOF"); break; },
                         Ok(_)  => { pager.add(&buf); },
                         Err(e) => { pager.add(&format!("Error: {}", e)); break; },
                     };
                 };
             });
 
-            loop {
-                let next_event_future = fs_stream.by_ref()
-                    .into_future()
-                    .select2(pager_stream.by_ref().into_future());
+            let mut fused_fs_stream = fs_stream.fuse();
+            let mut fused_recv = pager_stream.fuse();
 
-                match next_event_future.wait() {
-                    Ok(Either::A(((fs_event, _fs_stream), _))) => {
-                        let process_output_writer = writer.try_clone()?;
-                        self.process_event(&fs_event.unwrap(), Some(process_output_writer));
+            loop {
+                select!(
+                    fs_event = fused_fs_stream.next() => {
+                        match fs_event {
+                            Some(Ok(fs_event)) => {
+                                let process_output_writer = writer.try_clone()?;
+                                self.process_event(&fs_event, Some(process_output_writer));
+                            },
+                            Some(Err(e)) => {
+                                eprintln!("Something crashed in fs stream: {}", e);
+                                break;
+                            },
+                            None => unreachable!(),
+                        };
                     },
-                    Ok(Either::B(((pager_event, _pager_stream), _))) => {
-                        break;
-                    }
-                    Err(Either::A((_e, r))) => {
-                        println!("{:#?}", r);
-                        break;
-                    },
-                    _ => {
-                        println!("Generic error!");
-                        break;
-                    }
-                }
+                    _ = fused_recv => break,
+                    complete => break,
+                    default  => unreachable!(),
+                );
             }
         }
         else {
+            unreachable!();
+            /*
             for event in fs_stream.wait() {
                 self.process_event(&event.unwrap(), None);
             }
+            */
         }
 
         Ok(())
     }
 
-    fn start_pager(&self) -> Option<(Arc<Pager2>, Receiver<()>)> {
+    fn start_pager(&self) -> Option<(Arc<Pager>, Receiver<()>)> {
         if let Some(running_pager) = &self.pager {
-            let (tx, rx) = channel(100);
+            let (tx, rx) = channel();
             let exit_monitor = running_pager.clone();
             std::thread::spawn(move || {
                 exit_monitor.run();
-                tx.send(())
-                    .map_err(|e| panic!("Error!: {}", e))
+                tokio::spawn(async move {
+                    if let Err(e) = tx.send(()) {
+                        eprintln!("Error sending process completion: {:?}", e);
+                    }
+                });
             });
             Some((running_pager.clone(), rx))
         }
@@ -202,7 +211,7 @@ impl Runtime {
         }
     }
 
-    fn get_stream(&mut self) -> EventStream<BytesMut> {
+    fn get_stream(&mut self) -> std::io::Result<EventStream<BytesMut>> {
         self.inotify.event_stream(self.make_buffer())
     }
 
@@ -232,7 +241,7 @@ impl Runtime {
     }
 
     /// Add the given path to the runtime.
-    pub fn watch_directories(&mut self, path: &AsRef<Path>) -> Result<(), String> {
+    pub fn watch_directories(&mut self, path: &dyn AsRef<Path>) -> Result<(), String> {
         let mask = WatchMask::CLOSE_WRITE | WatchMask::MOVE | WatchMask::CREATE;
 
         let overrides = OverrideBuilder::new(path)
@@ -271,7 +280,7 @@ impl Runtime {
     }
 
     /// Construct a `Command` for the given input.
-    fn get_command(&mut self, next: &AsRef<Path>, output: Option<PipeWriter>) -> Result<Command, String> {
+    fn get_command(&mut self, next: &dyn AsRef<Path>, output: Option<PipeWriter>) -> Result<Command, String> {
         let mut c = Command::new(&self.command);
         c.args(self.args
             .iter()
@@ -287,7 +296,7 @@ impl Runtime {
     }
 
     /// Given a file name, build and start a child process.
-    fn start(&mut self, next: &AsRef<Path>, output: Option<PipeWriter>) -> Result<Arc<SharedChild>, String> {
+    fn start(&mut self, next: &dyn AsRef<Path>, output: Option<PipeWriter>) -> Result<Arc<SharedChild>, String> {
         let mut command = self.get_command(next, output)?;
         let child = SharedChild::spawn(&mut command)
             .map_err(|e| format!("Spawn error: {}", e.to_string()))?;
@@ -304,14 +313,14 @@ impl Runtime {
 
 #[cfg(test)]
 mod test {
-    use tempfile::{ tempdir, TempDir };
+    // use tempfile::{ tempdir, TempDir };
     use std::error::Error;
     use os_pipe::{pipe};
     use std::io::Read;
-    use std::fs::File;
-    use inotify::{EventStream};
-    use futures::stream::Stream;
-    use std::io::{ BufReader, BufRead, Write };
+    // use std::fs::File;
+    // use inotify::{EventStream};
+    //use futures::stream::Stream;
+    // use std::io::{ BufReader, BufRead, Write };
 
     #[test]
     fn construction() {
@@ -320,7 +329,7 @@ mod test {
     }
 
     #[test]
-    fn command_spawning() -> Result<(), Box<Error>> {
+    fn command_spawning() -> Result<(), Box<dyn Error>> {
         let (mut reader, writer) = pipe()?;
         let mut runtime = super::Runtime::new(vec!("echo",  "Test", "{}").into_iter().map(str::to_string).collect())?;
         let tracker = runtime.start(&"Hello.txt", Some(writer))?;
@@ -330,14 +339,14 @@ mod test {
         assert_eq!("Test Hello.txt\n", output);
         Ok(())
     }
-
+/*
     #[test]
-    fn watch_directories() -> Result<(), Box<Error>> {
+    fn watch_directories() -> Result<(), Box<dyn Error>> {
         let (reader, writer) = pipe()?;
         let mut reader = BufReader::new(reader);
         let dir: TempDir = tempdir().unwrap();
         let mut runtime = super::Runtime::new(vec!("echo", "Test", "{}").into_iter().map(str::to_string).collect())?;
-        let mut stream: EventStream<_> = runtime.get_stream();
+        let mut stream: EventStream<_> = runtime.get_stream()?;
         runtime.watch_directories(&dir)?;
         let tmp_path = dir.path().join("Fake.txt");
 
@@ -345,7 +354,7 @@ mod test {
         File::create(&tmp_path)
             .expect("Failed to create temp file");
 
-        let event = stream.by_ref().wait().next().unwrap().unwrap();
+        let event = stream.wait().next().unwrap().unwrap();
         let path = runtime.get_event_path(&event);
         assert_eq!(tmp_path, path.unwrap());
 
@@ -372,4 +381,5 @@ mod test {
         assert_eq!(format!("Test {}\n", tmp_path.display()), output);
         Ok(())
     }
+    */
 }
