@@ -6,29 +6,18 @@ use fwatch::Runtime;
 use regex::Regex;
 use std::error::Error;
 
-use inotify::{
-    Inotify,
-    WatchMask,
-};
-
 enum CommandInput {
-    Run(Runtime),
+    Run(Runtime, Vec<String>),
     Completions,
 }
 
 #[tokio::main]
 async fn main() {
-
-    let mut inotify = Inotify::init()
-        .expect("Failed to initialize inotify");
-
-    inotify.add_watch(".", WatchMask::CREATE | WatchMask::MODIFY).expect("...");
-
     match parse_cli() {
         Err(e) => {
             eprintln!("CLI Error: {}", e);
         }
-        Ok(CommandInput::Run(runtime)) => {
+        Ok(CommandInput::Run(runtime, dirs)) => {
             match runtime.run().await {
                 Err(e) => eprintln!("Top level error {:?}", e),
                 Ok(_)  => {},
@@ -97,16 +86,14 @@ fn parse_cli() -> Result<CommandInput, Box<dyn Error>> {
             matches.value_of("regex")
                 .map(|re| runtime.set_regex(Regex::new(re).expect("Invalid regex")));
 
-            matches.values_of("dirs")
+            let dirs = matches.values_of("dirs")
                 .ok_or_else(|| "No dirs provided")?
-                .for_each(|dir| {
-                    runtime.watch_directories(&dir)
-                        .expect("Error watching directories");
-                });
+                .map(str::to_string)
+                .collect();
 
             runtime.use_pager(matches.is_present("pager"))?;
 
-            Ok(CommandInput::Run(runtime))
+            Ok(CommandInput::Run(runtime, dirs))
         }
         (_, _) => unimplemented!(),
     }

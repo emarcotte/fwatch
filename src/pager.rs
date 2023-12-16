@@ -6,13 +6,10 @@ use std::error::Error;
 use std::fmt::Write as FmtWrite;
 use std::io::{Write as IoWrite, stdout, stdin, Stdout, };
 use std::sync::{Mutex, RwLock};
+use termion::input::TermRead;
 use self::{
-    state::{
-        PagerState
-    },
-    input::{
-        InputState,
-    },
+    state::PagerState,
+    input::InputState,
 };
 use termion::raw::IntoRawMode;
 
@@ -105,20 +102,23 @@ impl Pager {
     }
 
     pub fn run(&self) {
-        use termion::input::TermRead;
         let stdin = stdin();
         self.draw();
 
         for c in stdin.keys() {
-            if let Ok(current_state) = self.state.read() {
-                match input::handle_key(self, &current_state, &c.unwrap()) {
-                    InputState::Exit => break,
-                    next_state => {
-                        if let Ok(mut current_state) = self.state.write() {
-                            *current_state = next_state;
-                        }
-                    },
-                }
+            let current_state = self.state.read()
+                .expect("State lock poisoned on read");
+
+            // Dispatch to relevant handler and figure out what state changes need to be applied.
+            match input::handle_key(self, &current_state, &c.unwrap()) {
+                InputState::Exit => break,
+
+                // If given a new state, swap to it.
+                next_state => {
+                    let mut current_state = self.state.write()
+                        .expect("State lock poisoned on write");
+                    *current_state = next_state;
+                },
             }
             self.draw();
         }

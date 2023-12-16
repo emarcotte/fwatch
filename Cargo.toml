@@ -18,8 +18,8 @@ winapi = "0.3.8"
 version = "^0.2.22"
 features = ['full']
 
-[dependencies.inotify]
-version = "*"
+[dependencies.notify]
+version = "5.0.0-pre.3"
 
 [dependencies.futures]
 version = "^0.3.1"
